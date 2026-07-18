@@ -1,5 +1,5 @@
 import { Router, type IRouter } from "express";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, sql } from "drizzle-orm";
 import { db } from "../db";
 import { quotes } from "../db/schema";
 
@@ -9,8 +9,12 @@ function genId(): string {
   return Date.now().toString() + Math.random().toString(36).slice(2, 11);
 }
 
-function genNumber(): number {
-  return Math.floor(Math.random() * 90000) + 10000;
+/** Next sequential quote number (1, 2, 3...), based on the highest one saved so far. */
+async function nextNumber(): Promise<number> {
+  const [row] = await db
+    .select({ max: sql<number>`coalesce(max(${quotes.number}), 0)` })
+    .from(quotes);
+  return (row?.max ?? 0) + 1;
 }
 
 router.get("/quotes", async (_req, res) => {
@@ -23,7 +27,7 @@ router.post("/quotes", async (req, res) => {
   const quote = {
     ...body,
     id: genId(),
-    number: genNumber(),
+    number: await nextNumber(),
     date: new Date().toISOString(),
   };
   const [row] = await db.insert(quotes).values(quote).returning();
