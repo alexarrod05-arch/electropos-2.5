@@ -63,6 +63,27 @@ router.patch("/products/bulk-margin", async (req, res) => {
   res.json(rows);
 });
 
+/** Sets an explicit price for many products at once — used by the percentage price
+ * adjustment tool and by its "undo" (which just replays the previous prices). */
+router.patch("/products/bulk-prices", async (req, res) => {
+  const items: { id: string; price: number }[] = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (items.length === 0) {
+    res.status(400).json({ error: "No items provided" });
+    return;
+  }
+  const saved = [];
+  for (const item of items) {
+    if (!item.id || typeof item.price !== "number") continue;
+    const [row] = await db
+      .update(products)
+      .set({ price: item.price })
+      .where(eq(products.id, item.id))
+      .returning();
+    if (row) saved.push(row);
+  }
+  res.json(saved);
+});
+
 router.post("/products", async (req, res) => {
   const body = req.body;
   const product = {
