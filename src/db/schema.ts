@@ -3,6 +3,7 @@ import { pgTable, text, integer, doublePrecision, jsonb } from "drizzle-orm/pg-c
 export const products = pgTable("products", {
   id: text("id").primaryKey(),
   code: text("code"),
+  barcode: text("barcode"),
   name: text("name").notNull(),
   description: text("description"),
   price: doublePrecision("price").notNull(),
