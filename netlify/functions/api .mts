@@ -19,3 +19,4 @@ const wrapped = serverless(app, {
 });
 
 export const handler = wrapped;
+
