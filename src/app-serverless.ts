@@ -11,6 +11,8 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-app.use("/api", router);
+// Mounted at root — the Netlify function wrapper strips whatever prefix
+// Netlify sends (which varies) down to the bare path before this runs.
+app.use("/", router);
 
 export default app;
