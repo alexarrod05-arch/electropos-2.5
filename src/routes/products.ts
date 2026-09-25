@@ -23,7 +23,7 @@ router.post("/products/bulk", async (req, res) => {
     }
     const now = new Date().toISOString();
 
-    // Consultamos únicamente los códigos existentes para optimizar memoria
+    // Obtener productos existentes para resolver identificadores
     const existingRows = await db
       .select({ id: products.id, code: products.code, barcode: products.barcode })
       .from(products);
@@ -34,60 +34,56 @@ router.post("/products/bulk", async (req, res) => {
       if (key) byCode.set(key, { id: row.id, barcode: row.barcode });
     }
 
-    const toInsert: Record<string, unknown>[] = [];
-    const toUpdate: { id: string; data: Record<string, unknown> }[] = [];
+    const recordsToUpsert: Record<string, unknown>[] = [];
 
     for (const item of items as Record<string, unknown>[]) {
       const key = String(item.code ?? "").trim().toLowerCase();
       const match = key ? byCode.get(key) : undefined;
-      if (match) {
-        toUpdate.push({
-          id: match.id,
-          data: {
-            name: item.name,
-            price: item.price,
-            cost: item.cost,
-            stock: item.stock,
-            category: item.category,
-            ...(!match.barcode && item.barcode ? { barcode: item.barcode } : {}),
-          },
-        });
-      } else {
-        toInsert.push({ ...item, id: genId(), createdAt: now });
-      }
+
+      recordsToUpsert.push({
+        id: match ? match.id : genId(),
+        code: item.code ?? null,
+        name: item.name ?? null,
+        price: item.price ?? 0,
+        cost: item.cost ?? null,
+        stock: item.stock ?? 0,
+        category: item.category ?? null,
+        barcode: match?.barcode ? match.barcode : (item.barcode ?? null),
+        createdAt: now,
+      });
     }
 
     const saved: Record<string, unknown>[] = [];
-
-    // 1. Inserciones en bloques (CHUNK_SIZE = 200)
     const CHUNK_SIZE = 200;
-    for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
-      const chunk = toInsert.slice(i, i + CHUNK_SIZE);
-      if (chunk.length === 0) continue;
-      const rows = await db.insert(products).values(chunk).returning();
-      saved.push(...rows);
-    }
 
-    // 2. Actualizaciones paralelas por lotes para no bloquear la base de datos ni agotar el tiempo
-    for (let i = 0; i < toUpdate.length; i += CHUNK_SIZE) {
-      const chunk = toUpdate.slice(i, i + CHUNK_SIZE);
-      const updatesPromises = chunk.map((u) =>
-        db
-          .update(products)
-          .set(u.data)
-          .where(eq(products.id, u.id))
-          .returning()
-      );
-      const results = await Promise.all(updatesPromises);
-      for (const [row] of results) {
-        if (row) saved.push(row);
-      }
+    // Inserción / Actualización ultrarrápida mediante ON CONFLICT (UPSERT)
+    for (let i = 0; i < recordsToUpsert.length; i += CHUNK_SIZE) {
+      const chunk = recordsToUpsert.slice(i, i + CHUNK_SIZE);
+      if (chunk.length === 0) continue;
+
+      const rows = await db
+        .insert(products)
+        .values(chunk)
+        .onConflictDoUpdate({
+          target: products.id,
+          set: {
+            name: sql`EXCLUDED.name`,
+            price: sql`EXCLUDED.price`,
+            cost: sql`EXCLUDED.cost`,
+            stock: sql`EXCLUDED.stock`,
+            category: sql`EXCLUDED.category`,
+            barcode: sql`EXCLUDED.barcode`,
+          },
+        })
+        .returning();
+
+      saved.push(...rows);
     }
 
     res.status(201).json(saved);
   } catch (err) {
     console.error("Error en importación masiva:", err);
-    res.status(500).json({ error: "Error al procesar la importación masiva" });
+    res.status(500).json({ error: "Error procesando la lista" });
   }
 });
 
