@@ -15,64 +15,80 @@ router.get("/products", async (_req, res) => {
 });
 
 router.post("/products/bulk", async (req, res) => {
-  const items = Array.isArray(req.body?.products) ? req.body.products : [];
-  if (items.length === 0) {
-    res.status(400).json({ error: "No products provided" });
-    return;
-  }
-  const now = new Date().toISOString();
-
-  // Match incoming rows against products that already exist (by SKU/código).
-  // Re-importing the same price list then UPDATES price/stock on the existing
-  // row instead of creating a duplicate — which is what keeps a manually
-  // typed barcode from being wiped out every time a list gets re-imported.
-  const existingRows = await db
-    .select({ id: products.id, code: products.code, barcode: products.barcode })
-    .from(products);
-  const byCode = new Map<string, { id: string; barcode: string | null }>();
-  for (const row of existingRows) {
-    const key = row.code?.trim().toLowerCase();
-    if (key) byCode.set(key, { id: row.id, barcode: row.barcode });
-  }
-
-  const toInsert: Record<string, unknown>[] = [];
-  const toUpdate: { id: string; data: Record<string, unknown> }[] = [];
-
-  for (const item of items as Record<string, unknown>[]) {
-    const key = String(item.code ?? "").trim().toLowerCase();
-    const match = key ? byCode.get(key) : undefined;
-    if (match) {
-      toUpdate.push({
-        id: match.id,
-        data: {
-          name: item.name,
-          price: item.price,
-          cost: item.cost,
-          stock: item.stock,
-          category: item.category,
-          // Never overwrite a barcode that's already saved with a blank one from the file.
-          ...(!match.barcode && item.barcode ? { barcode: item.barcode } : {}),
-        },
-      });
-    } else {
-      toInsert.push({ ...item, id: genId(), createdAt: now });
+  try {
+    const items = Array.isArray(req.body?.products) ? req.body.products : [];
+    if (items.length === 0) {
+      res.status(400).json({ error: "No products provided" });
+      return;
     }
-  }
+    const now = new Date().toISOString();
 
-  const saved: Record<string, unknown>[] = [];
-  const CHUNK_SIZE = 200;
-  for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
-    const chunk = toInsert.slice(i, i + CHUNK_SIZE);
-    if (chunk.length === 0) continue;
-    const rows = await db.insert(products).values(chunk).returning();
-    saved.push(...rows);
-  }
-  for (const u of toUpdate) {
-    const [row] = await db.update(products).set(u.data).where(eq(products.id, u.id)).returning();
-    if (row) saved.push(row);
-  }
+    // Consultamos únicamente los códigos existentes para optimizar memoria
+    const existingRows = await db
+      .select({ id: products.id, code: products.code, barcode: products.barcode })
+      .from(products);
 
-  res.status(201).json(saved);
+    const byCode = new Map<string, { id: string; barcode: string | null }>();
+    for (const row of existingRows) {
+      const key = row.code?.trim().toLowerCase();
+      if (key) byCode.set(key, { id: row.id, barcode: row.barcode });
+    }
+
+    const toInsert: Record<string, unknown>[] = [];
+    const toUpdate: { id: string; data: Record<string, unknown> }[] = [];
+
+    for (const item of items as Record<string, unknown>[]) {
+      const key = String(item.code ?? "").trim().toLowerCase();
+      const match = key ? byCode.get(key) : undefined;
+      if (match) {
+        toUpdate.push({
+          id: match.id,
+          data: {
+            name: item.name,
+            price: item.price,
+            cost: item.cost,
+            stock: item.stock,
+            category: item.category,
+            ...(!match.barcode && item.barcode ? { barcode: item.barcode } : {}),
+          },
+        });
+      } else {
+        toInsert.push({ ...item, id: genId(), createdAt: now });
+      }
+    }
+
+    const saved: Record<string, unknown>[] = [];
+
+    // 1. Inserciones en bloques (CHUNK_SIZE = 200)
+    const CHUNK_SIZE = 200;
+    for (let i = 0; i < toInsert.length; i += CHUNK_SIZE) {
+      const chunk = toInsert.slice(i, i + CHUNK_SIZE);
+      if (chunk.length === 0) continue;
+      const rows = await db.insert(products).values(chunk).returning();
+      saved.push(...rows);
+    }
+
+    // 2. Actualizaciones paralelas por lotes para no bloquear la base de datos ni agotar el tiempo
+    for (let i = 0; i < toUpdate.length; i += CHUNK_SIZE) {
+      const chunk = toUpdate.slice(i, i + CHUNK_SIZE);
+      const updatesPromises = chunk.map((u) =>
+        db
+          .update(products)
+          .set(u.data)
+          .where(eq(products.id, u.id))
+          .returning()
+      );
+      const results = await Promise.all(updatesPromises);
+      for (const [row] of results) {
+        if (row) saved.push(row);
+      }
+    }
+
+    res.status(201).json(saved);
+  } catch (err) {
+    console.error("Error en importación masiva:", err);
+    res.status(500).json({ error: "Error al procesar la importación masiva" });
+  }
 });
 
 router.delete("/products/bulk", async (req, res) => {
@@ -109,16 +125,25 @@ router.patch("/products/bulk-prices", async (req, res) => {
     res.status(400).json({ error: "No items provided" });
     return;
   }
+
+  const CHUNK_SIZE = 200;
   const saved = [];
-  for (const item of items) {
-    if (!item.id || typeof item.price !== "number") continue;
-    const [row] = await db
-      .update(products)
-      .set({ price: item.price })
-      .where(eq(products.id, item.id))
-      .returning();
-    if (row) saved.push(row);
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    const chunk = items.slice(i, i + CHUNK_SIZE);
+    const promises = chunk.map((item) => {
+      if (!item.id || typeof item.price !== "number") return null;
+      return db
+        .update(products)
+        .set({ price: item.price })
+        .where(eq(products.id, item.id))
+        .returning();
+    });
+    const results = await Promise.all(promises);
+    for (const resArr of results) {
+      if (resArr && resArr[0]) saved.push(resArr[0]);
+    }
   }
+
   res.json(saved);
 });
 
